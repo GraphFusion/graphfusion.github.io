@@ -1,0 +1,92 @@
+name: Publish documentation
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: GraphFusion/GraphFusion branch or commit
+        default: main
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ASTRO_TELEMETRY_DISABLED: '1'
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.source.outputs.changed }}
+      sha: ${{ steps.source.outputs.sha }}
+      tree: ${{ steps.source.outputs.tree }}
+    steps:
+      - name: Check documentation source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          sha=$(gh api "repos/GraphFusion/GraphFusion/commits/$SOURCE_REF" --jq .sha)
+          tree=$(gh api "repos/GraphFusion/GraphFusion/git/trees/$sha" --jq '.tree[] | select(.path == "website") | .sha')
+          test -n "$tree"
+          published=$(curl -fsSL --max-time 30 https://graphfusion.github.io/source-revision.txt || true)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ] || [ "$tree" != "$published" ]; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: changes
+    if: needs.changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: https://graphfusion.github.io/
+    defaults:
+      run:
+        working-directory: source/website
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: GraphFusion/GraphFusion
+          ref: ${{ needs.changes.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: source/website/package-lock.json
+      - run: npm ci
+      - name: Require root site configuration
+        id: root
+        run: |
+          node --input-type=module -e "import config from './astro.config.mjs'; console.log('ready=' + ((config.base ?? '/') === '/'));" >> "$GITHUB_OUTPUT"
+      - if: steps.root.outputs.ready == 'true'
+        run: npm run check && npm run build
+      - if: steps.root.outputs.ready == 'true'
+        env:
+          SOURCE_TREE: ${{ needs.changes.outputs.tree }}
+        run: printf '%s\n' "$SOURCE_TREE" > dist/source-revision.txt
+      - if: steps.root.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: source/website/dist
+      - if: steps.root.outputs.ready == 'true'
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
